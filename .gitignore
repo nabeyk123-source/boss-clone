@@ -1,0 +1,56 @@
+# Secrets — 絶対に公開リポへ push しない
+.env
+.env.*
+!.env.example
+*.key
+*.pem
+service-account*.json
+gcp-credentials*.json
+
+# Learning data — プライバシー資産、ローカル保管のみ
+data/raw/
+data/processed/
+data/interim/
+!data/**/.gitkeep
+!data/README.md
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+dist/
+*.egg-info/
+.eggs/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Virtual envs
+.venv/
+venv/
+env/
+
+# IDE / editor
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ADK / Vertex AI ローカルキャッシュ
+.adk/
+.cache/
+
+# Logs
+*.log
+logs/
