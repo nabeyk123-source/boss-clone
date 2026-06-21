@@ -7,10 +7,14 @@
 service-account*.json
 gcp-credentials*.json
 
+# Masking dictionary — VD固有用語を含むため非公開
+docs/masking_dictionary.json
+
 # Learning data — プライバシー資産、ローカル保管のみ
 data/raw/
 data/processed/
 data/interim/
+data/excluded/
 !data/**/.gitkeep
 !data/README.md
 

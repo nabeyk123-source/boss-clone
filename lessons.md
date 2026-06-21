@@ -42,3 +42,15 @@
   ファイル外で対処するなら環境変数 `PYTHONIOENCODING=utf-8` でも同等。CI/Cloud Run 側では発生しないため、ローカル動作確認のためだけに必要。
 - 適用範囲: Windows 環境でローカル実行する Python スクリプトのうち、日本語入力を受けて Claude / Gemini など外部 LLM API へ送るもの全般。CLI / 対話ループに限らず、CSV や JSON ファイルから日本語を読む処理でも encoding 未指定だと同型を踏む可能性あり。
 - 横展開判断: **保留**（理由: Windows 特有の症状で、Mac / Linux / Cloud Run では再現しない。他案件で再現したら nfr-base.md の知見ログへ昇格して B-6 ログレベリングや C-7 周辺の補足として組み込む候補）。
+
+### L-002: Claude エクスポートに含まれる PII / 業務機密を発見、対応戦略を確立
+- 日付: 2026-06-21
+- 症状: Day 2 タスク1 のデータ分析（[scripts/analyze_export.py](scripts/analyze_export.py)）で、`users.json` に氏名・メアド・電話番号、`memories.json` に勤務先（VD・親会社）・部署・役職・社長名・社内検討中ビジネス構想、`conversations.json` 本文にも同類の固有名詞が含まれることを確認。当初の CLAUDE.md 適用判断で `[PII] ☐` としていた前提が崩れた。
+- 原因: Claude との日常対話は実名・実情報・現実の業務文脈で行われるため、エクスポートデータは**実運用ログそのもの**になる。ハッカソン提出物として公開リポジトリ + Cloud Run + Proto Pedia + 決勝プレゼンで公開する以上、生データを公開動線に乗せることは不可。
+- 解決:
+  1. **架空企業 Acme Corp 設計書**（[docs/acme_corp_spec.md](docs/acme_corp_spec.md)）を作成し、公開デモはこの設定のみで動作させる
+  2. **変換辞書**（`docs/masking_dictionary.json`）で VD → Acme の固有名詞マッピングを定義。辞書自体も内部用語が逆引き可能なため `.gitignore` で保護
+  3. **多層防御パイプライン**（[docs/pii_strategy.md](docs/pii_strategy.md)）で「ソース分離→ブラックリスト除外→マスキング→レビューキュー→出力フィルタ→監査ログ」を構造化
+  4. CLAUDE.md にトリガー `[PII] ☑ / [SECRET] ☑ / [PUBLIC_DEMO] ☑` を新設・格上げ、`C-6 個人情報保護対応` を採用要件に追加
+- 適用範囲: Claude / ChatGPT 等の LLM 対話ログをハッカソン・ポートフォリオ・公開デモなど **外部公開を伴うプロジェクト** で活用する全ケース。個人開発でログを再利用したくなる場面全般。「LLM 対話ログ = 実運用ログ」という前提認識自体が横展開価値の本質。
+- 横展開判断: **昇格候補**（理由: 規制系プロジェクト・ポートフォリオ化したい個人開発・社内 PoC を社外発信する局面など、再発が確実に予想される。boss-clone 完了時 or 他案件で同型を踏んだ時点で `_standards/nfr-base.md` に「LLM 対話ログを学習データ化する際の境界設計」として E-2 補足 または C-6 補足で昇格させる）。
