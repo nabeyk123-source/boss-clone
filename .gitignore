@@ -58,3 +58,6 @@ desktop.ini
 # Logs
 *.log
 logs/
+
+# Vector Search 運用状態（GCP リソース ID、ローカル運用専用）
+scripts/*.state.json

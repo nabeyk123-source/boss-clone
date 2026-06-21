@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import time
 from dataclasses import dataclass
 from typing import Iterable
 
@@ -34,6 +35,10 @@ class ClassifyConfig:
     max_retries: int = 3
     initial_backoff_s: float = 1.0
     input_char_cap: int = 500
+    # Gemini 2.5 系は thinking モデルで、出力トークン予算が reasoning に使われると本文が空になる。
+    # thinking_budget=0 で「考えずに即答する」モードにしてコスト・遅延・空応答リスクを抑える。
+    thinking_budget: int = 0
+    max_output_tokens: int = 16
 
 
 def _build_client():
@@ -61,38 +66,46 @@ def _normalize_tag(text: str) -> str:
     return "保留"
 
 
-async def _classify_one(client, sem: asyncio.Semaphore, cfg: ClassifyConfig, human_text: str) -> tuple[str, str]:
-    """1ペアを分類。返り値 (tag, status) status: "ok"/"retry_exhausted"/"empty"。"""
+async def _classify_one(client, sem: asyncio.Semaphore, cfg: ClassifyConfig, human_text: str) -> tuple[str, str, float]:
+    """1ペアを分類。返り値 (tag, status, latency_s)。
+
+    status: "ok" / "empty" / "retry_exhausted:{ExcType}" / "loop_exit"
+    latency_s: API 呼び出しに要した壁時計時間（リトライ込み、semaphore 待ち時間は含まない）
+    """
     prompt = PROMPT.format(human_text=(human_text or "")[: cfg.input_char_cap])
     async with sem:
         backoff = cfg.initial_backoff_s
+        t_start = time.perf_counter()
         for attempt in range(cfg.max_retries):
             try:
                 resp = await client.aio.models.generate_content(
                     model=cfg.model,
                     contents=prompt,
                     config={
-                        "max_output_tokens": 10,
+                        "max_output_tokens": cfg.max_output_tokens,
                         "temperature": 0.1,
+                        "thinking_config": {"thinking_budget": cfg.thinking_budget},
                     },
                 )
+                latency = time.perf_counter() - t_start
                 text = getattr(resp, "text", "") or ""
                 if not text.strip():
-                    return "保留", "empty"
-                return _normalize_tag(text), "ok"
+                    return "保留", "empty", latency
+                return _normalize_tag(text), "ok", latency
             except Exception as e:  # noqa: BLE001 — レート制限・一時障害含めて backoff
                 if attempt == cfg.max_retries - 1:
-                    return "保留", f"retry_exhausted:{type(e).__name__}"
+                    return "保留", f"retry_exhausted:{type(e).__name__}", time.perf_counter() - t_start
                 await asyncio.sleep(backoff)
                 backoff *= 2
-    return "保留", "loop_exit"
+    return "保留", "loop_exit", time.perf_counter() - t_start
 
 
 async def classify_many(
     human_texts: list[str],
     cfg: ClassifyConfig | None = None,
     progress_cb=None,
-) -> list[tuple[str, str]]:
+) -> list[tuple[str, str, float]]:
+    """並列で全テキストを分類。返り値の各要素は (tag, status, latency_s)。"""
     cfg = cfg or ClassifyConfig()
     client = _build_client()
     sem = asyncio.Semaphore(cfg.max_concurrency)
@@ -100,7 +113,7 @@ async def classify_many(
     done = 0
     total = len(human_texts)
 
-    async def wrapper(text: str) -> tuple[str, str]:
+    async def wrapper(text: str) -> tuple[str, str, float]:
         nonlocal done
         r = await _classify_one(client, sem, cfg, text)
         done += 1

@@ -171,7 +171,13 @@ def render_report(stats: dict, out_path: Path) -> None:
     w("## 処理時間・コスト")
     w(f"- 総処理時間: {stats['duration_s']:.1f} 秒")
     if stats["mode_classify"]:
-        w(f"- Gemini 呼び出し: {stats['classify_calls']} 回 / 失敗 {stats['classify_failures']} 回")
+        w(f"- Gemini 呼び出し: {stats['classify_calls']} 回 / 失敗 {stats['classify_failures']} 回 "
+          f"(retry_exhausted: {stats['classify_retry_exhausted']}, empty: {stats['classify_empty']})")
+        w(f"- classify wall-time: {stats['classify_wall_s']:.1f} 秒  "
+          f"throughput: {stats['throughput_qps']:.2f} req/s")
+        ls = stats["latency_stats"]
+        w(f"- レイテンシ (api call): avg {ls['avg_s']*1000:.0f}ms / p50 {ls['p50_s']*1000:.0f}ms "
+          f"/ p95 {ls['p95_s']*1000:.0f}ms / p99 {ls['p99_s']*1000:.0f}ms / max {ls['max_s']*1000:.0f}ms")
         w(f"- 概算入力トークン: {stats['est_input_tokens']:,} / 出力 {stats['est_output_tokens']:,}")
         w(f"- 推定コスト（参考値、Vertex AI Gemini 2.5 Flash 料金）: ${stats['est_cost_usd']:.2f}")
     else:
@@ -314,12 +320,17 @@ def run(args: argparse.Namespace) -> int:
     tag_dist: Counter[str] = Counter()
     classify_calls = 0
     classify_failures = 0
+    classify_retry_exhausted = 0
+    classify_empty = 0
     est_input_tokens = 0
     est_output_tokens = 0
-    tags: list[tuple[str, str]] = []
+    tags: list[tuple[str, str, float]] = []
+    latency_stats: dict[str, float] = {"avg_s": 0.0, "max_s": 0.0, "p50_s": 0.0, "p95_s": 0.0, "p99_s": 0.0, "total_s": 0.0}
+    classify_wall_s = 0.0
 
     if not args.no_classify and masked_pairs_buffer:
-        log.info("[stage2] classify %d pairs via Vertex AI Gemini", len(masked_pairs_buffer))
+        log.info("[stage2] classify %d pairs via Vertex AI Gemini (concurrency=%d)",
+                 len(masked_pairs_buffer), args.max_concurrency)
         from masking_lib.classifier import ClassifyConfig, classify_many
 
         cfg = ClassifyConfig(max_concurrency=args.max_concurrency)
@@ -328,19 +339,34 @@ def run(args: argparse.Namespace) -> int:
             log.info("classify progress: %d/%d", done, total)
 
         human_texts = [p["human_text"] for p in masked_pairs_buffer]
+        t_classify = time.perf_counter()
         tags = asyncio.run(classify_many(human_texts, cfg, progress_cb=progress))
+        classify_wall_s = time.perf_counter() - t_classify
+
         classify_calls = len(tags)
-        classify_failures = sum(1 for _, st in tags if st != "ok")
-        for tag, _ in tags:
+        classify_failures = sum(1 for _, st, _ in tags if st != "ok")
+        classify_retry_exhausted = sum(1 for _, st, _ in tags if st.startswith("retry_exhausted"))
+        classify_empty = sum(1 for _, st, _ in tags if st == "empty")
+        for tag, _, _ in tags:
             tag_dist[tag] += 1
-        # ざっくり概算（500 chars ≈ 350 tokens 程度の日本語見積もり）
+
+        latencies = sorted(lat for _, _, lat in tags)
+        if latencies:
+            latency_stats["total_s"] = sum(latencies)
+            latency_stats["avg_s"] = latency_stats["total_s"] / len(latencies)
+            latency_stats["max_s"] = latencies[-1]
+            latency_stats["p50_s"] = latencies[len(latencies) // 2]
+            latency_stats["p95_s"] = latencies[min(len(latencies) - 1, int(len(latencies) * 0.95))]
+            latency_stats["p99_s"] = latencies[min(len(latencies) - 1, int(len(latencies) * 0.99))]
+
+        # ざっくり概算（500 chars ≈ 333 tokens 程度の日本語見積もり）
         for human_text in human_texts:
             est_input_tokens += min(len(human_text) // 1.5, 333)
         est_input_tokens = int(est_input_tokens)
         est_output_tokens = classify_calls * 5
     else:
         log.info("[stage2] classify skipped (--no-classify)")
-        tags = [("保留", "skipped")] * len(masked_pairs_buffer)
+        tags = [("保留", "skipped", 0.0)] * len(masked_pairs_buffer)
 
     # 4-5/4-6: レビュー振り分け + 監査ログ
     log.info("[stage3] route + write outputs")
@@ -348,7 +374,7 @@ def run(args: argparse.Namespace) -> int:
          audit_mod.JsonlWriter(PATH_REVIEW_QUEUE) as wr, \
          audit_mod.JsonlWriter(PATH_AUDIT_LOG) as wa:
 
-        for pair, (tag, tag_status) in zip(masked_pairs_buffer, tags):
+        for pair, (tag, tag_status, _lat) in zip(masked_pairs_buffer, tags):
             had_pii = bool(pair["_pii_masks"])
             pii_types = sorted({m["type"] for m in pair["_pii_masks"]})
             review = needs_review(pair["_pii_masks"], pair["_unknowns"], tag, tag_status)
@@ -467,6 +493,11 @@ def run(args: argparse.Namespace) -> int:
         "tag_dist": dict(tag_dist),
         "classify_calls": classify_calls,
         "classify_failures": classify_failures,
+        "classify_retry_exhausted": classify_retry_exhausted,
+        "classify_empty": classify_empty,
+        "classify_wall_s": classify_wall_s,
+        "latency_stats": latency_stats,
+        "throughput_qps": (classify_calls / classify_wall_s) if classify_wall_s > 0 else 0.0,
         "est_input_tokens": est_input_tokens,
         "est_output_tokens": est_output_tokens,
         "est_cost_usd": est_cost,

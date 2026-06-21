@@ -67,3 +67,38 @@
   5. apply_dictionary の挙動を test_masking_pipeline.py に追加検証（長語句優先 + 新規 target が source と衝突しないことを single-line で確認）
 - 適用範囲: 架空企業設定 + 実データマスキングを行う全プロジェクト。「マスキング辞書の初版は推測、フルランで実データ当ててから本物にする」を **2サイクル前提** で設計する。1サイクルで終わるつもりで作ると、辞書漏れ・衝突を実データを失わずに発見する機会が無い。
 - 横展開判断: **昇格候補**（理由: マスキング系プロジェクト全般に効く知見。「初版辞書 → 全件処理 → unknown 上位リスト読込 → 辞書改善 → 再処理」の反復ループは、規制系・社内データ・LLM 対話ログ系すべてで使える共通パターン。`docs/pii_strategy.md` のパイプライン定義へ「v1.X.Y イテレーション運用」として組み込む候補。boss-clone 完了時に [[feedback-lessons-workflow]] と合わせて昇格を検討する）。
+
+### L-004: AI 支援開発における「自己生成スクリプトの即時実行」リスクと permission rule 対策
+- 日付: 2026-06-21
+- 症状: Claude Code（私）が自分で書いた直後の `scripts/test_classifier_smoke.py` を実行しようとしたところ、Claude Code Auto Mode の分類器が「never written or shown in this transcript — running an unverified script that will call Vertex AI with credentials」として実行をブロック。
+- 原因: 「LLM が自己生成したスクリプトを、レビュー前にそのままユーザーの credentials で外部 API（Vertex AI / OpenAI 等）に叩かせる」という流れは、(a) 意図しない API 呼び出しの無限ループ、(b) 想定外コスト発生、(c) 学習データ・credentials の漏洩、というリスクを抱える。Auto Mode の分類器はこの組み合わせを構造的に弾く設計になっている。
+- 解決: `.claude/settings.local.json` の `permissions.allow` に **テストスクリプト限定の permission rule** を追加。
+  ```
+  Bash(.venv/Scripts/python.exe scripts/test_*)
+  ```
+  これにより `scripts/test_` プレフィックスの Python スクリプトは事前許可、本番スクリプト（`masking_pipeline.py` / 将来の `embedding_pipeline.py` 等）は引き続き個別ガード対象として残す。
+- 適用範囲: AI 支援開発全般、特に外部 API 呼び出しを伴う検証スクリプトを LLM に書かせる局面。`scripts/test_*` パターン以外（本番処理、デプロイ操作、credentials を直接扱う処理）は同じガードを維持する。「テストはテストフォルダ名で識別、本番は別」が運用の肝。
+- 横展開判断: **昇格候補**（理由: AI 支援開発の標準運用として `_standards/nfr-base.md` の C-2「シークレット管理」または運用ルール R 系に組み込む価値あり。pdm_and_ai note 記事化候補：「Claude Code に LLM 検証スクリプトを書かせる時の permission rule 設計」）。
+- 補足知見: smoke test 実行で **Gemini 2.5 Flash の thinking モデル特性** も判明した。`max_output_tokens=10` のままだと reasoning トークンに予算を全部使われて本文0（`status=empty`）になり、フォールバックの「保留」しか返らない。`thinking_config={"thinking_budget": 0}` で thinking 無効化、`max_output_tokens=16` に増設したところ 3/3 expected と完全一致。classifier.py の `ClassifyConfig` に同設定を恒久反映済み。
+
+### L-005: 削除系スクリプトは「失敗したら state を消さない」設計にする（teardown 冪等性 + 課金リソース取り残し回避）
+- 日付: 2026-06-21
+- 症状: Vector Search Phase 1 後の teardown で、`endpoint.undeploy_index(deployed_index_id=..., sync=True)` が `TypeError: unexpected keyword argument 'sync'` で失敗。例外を catch して warning ログだけ出し、**ループ末尾で state.json をクリアして「完了」と表示**してしまった。結果として endpoint は deployed のまま残存（課金継続中）なのに state は空、運用上「削除済み」と誤認する状態に。
+- 原因: 2つの設計ミスの重なり。
+  1. `aiplatform.MatchingEngineIndexEndpoint.undeploy_index()` は `sync` 引数を受け取らない（同期 LRO、`sync=True` は API 仕様外）。SDK バージョンで挙動が違う可能性もあるが、ここではドキュメント未確認のまま付けたのが直接原因。
+  2. teardown ロジックが「例外は log warning に降格 → 最後に必ず state を消す」フローだった。失敗時の state クリアは「次回 setup できない」だけでなく「課金リソースを誰も認識できない」最悪のサイレント失敗を生む。
+- 解決:
+  1. `undeploy_index(deployed_index_id=...)` から `sync=True` を削除
+  2. teardown を **「全段階の delete が成功した時だけ state を消す」「失敗を1つでも検出したら state を残して return（次回 retry 可能）」** に変更
+  3. state を手動で復元 → 修正版 teardown 実行 → 全リソース削除（5秒で完了）を確認
+- 適用範囲: **削除系スクリプト全般**。特にクラウドリソース（Vertex AI Vector Search Endpoint・Cloud Run service・Firestore DB・GCS bucket）など「残ると課金が続く」リソースを操作する全 teardown。state ファイル（resource ID キャッシュ）を持つ運用なら、失敗時は **state を絶対に消さない** こと。
+- 横展開判断: **昇格候補**（理由: AI 支援開発で「削除スクリプトの sync 引数」みたいな SDK 差異は今後も頻発する。`_standards/nfr-base.md` の C-2「シークレット/インフラ管理」周辺、または運用ルール R 系に「削除系スクリプトの冪等性原則」として追加候補）。
+- 補足: SDK の引数互換性は **試す前に `inspect.signature()` で確認**する習慣も入れる。今回は5秒で teardown 完了したから良かったが、本来は smoke setup 後すぐ teardown を叩いて挙動を確認しておくべきだった（45分かけてデプロイした後に teardown でハマると痛い）。
+
+### L-006: Vertex AI Vector Search は `.jsonl` 拡張子を読まない（`.json`/`.csv`/`.avro` のみ）
+- 日付: 2026-06-21
+- 症状: GCS に JSONL ファイル（拡張子 `.jsonl`）をアップロードして `MatchingEngineIndex.create_tree_ah_index(contents_delta_uri=...)` を呼ぶと、`google.api_core.exceptions.FailedPrecondition: 400 Found file ... with unknown format` で即座に失敗。
+- 原因: Vertex AI Vector Search の入力ファイル拡張子バリデーションが `.json`、`.csv`、`.avro` のみ受け付ける。中身が JSONL でも拡張子が `.jsonl` だと弾かれる。
+- 解決: GCS にアップロードする時に拡張子を `.json` にリネーム。**ローカル側は `.jsonl` のままで OK**（中身は JSONL 形式が正解）、アップロード処理だけ `if name.endswith(".jsonl"): name = name[:-1]` で吸収。`upload_jsonl()` 内に古い `.jsonl` blob をクリーンアップする処理も追加。
+- 適用範囲: Vertex AI Vector Search のインデックス構築全般。BATCH モードでも STREAM モードでも同じ。
+- 横展開判断: **保留**（理由: Vector Search 固有の細かい仕様。同種を踏まないように仕様書 `docs/schema_spec.md` §5.1 Step 7 に注意書きを追記しておくレベル）。
