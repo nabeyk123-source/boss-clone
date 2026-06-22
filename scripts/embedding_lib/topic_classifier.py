@@ -39,13 +39,14 @@ RULES: list[tuple[tuple[str, ...], str]] = [
 @dataclass
 class TopicConfig:
     model: str = "gemini-2.5-flash"
-    max_concurrency: int = 4
-    max_retries: int = 3
+    max_concurrency: int = 2
+    max_retries: int = 5
     initial_backoff_s: float = 1.0
     char_cap: int = 500
     thinking_budget: int = 0
     max_output_tokens: int = 60
     fallback_tag: str = "general"
+    pre_call_sleep_s: float = 0.5
 
 
 PROMPT = """以下は対話ペアの要約です。この内容を表すトピックタグを 1〜3 個、英小文字スネークケースで挙げてください。
@@ -101,6 +102,8 @@ async def _llm_tag_one(
 ) -> tuple[list[str], str, float]:
     prompt = PROMPT.format(summary=(summary or "")[: cfg.char_cap])
     async with sem:
+        if cfg.pre_call_sleep_s > 0:
+            await asyncio.sleep(cfg.pre_call_sleep_s)
         backoff = cfg.initial_backoff_s
         t_start = time.perf_counter()
         for attempt in range(cfg.max_retries):
@@ -155,7 +158,7 @@ async def classify_topics_many(
             idx, summary = idx_summary
             r = await _llm_tag_one(client, sem, cfg, summary)
             done_llm += 1
-            if progress_cb and (done_llm % 25 == 0 or done_llm == total_llm):
+            if progress_cb and (done_llm % 5 == 0 or done_llm == total_llm):
                 progress_cb(done_llm, total_llm)
             return idx, r
 

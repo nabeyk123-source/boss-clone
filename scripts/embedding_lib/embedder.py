@@ -20,8 +20,8 @@ EMBEDDING_DIM = 768
 class EmbedConfig:
     model: str = EMBEDDING_MODEL
     batch_size: int = 50  # 1 リクエストあたり最大 250 だが、safe で 50
-    max_concurrency: int = 4
-    max_retries: int = 3
+    max_concurrency: int = 2
+    max_retries: int = 5
     initial_backoff_s: float = 1.0
     task_type: str = "SEMANTIC_SIMILARITY"
     char_cap: int = 2000

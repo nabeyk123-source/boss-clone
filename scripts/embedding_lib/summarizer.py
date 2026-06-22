@@ -29,13 +29,16 @@ AIの応答:
 @dataclass
 class SummarizeConfig:
     model: str = "gemini-2.5-flash"
-    max_concurrency: int = 4
-    max_retries: int = 3
+    max_concurrency: int = 2
+    max_retries: int = 5
     initial_backoff_s: float = 1.0
     human_char_cap: int = 600
     assistant_char_cap: int = 600
     thinking_budget: int = 0
     max_output_tokens: int = 200
+    # レート保護: semaphore 取得後・API 呼び出し直前に sleep。
+    # 並列2 × 1req/0.5s = 秒間最大 4 req にしてレート制限を回避（L-008 候補）
+    pre_call_sleep_s: float = 0.5
 
 
 def _build_client():
@@ -68,6 +71,8 @@ async def _summarize_one(
         assistant_text=(assistant_text or "")[: cfg.assistant_char_cap],
     )
     async with sem:
+        if cfg.pre_call_sleep_s > 0:
+            await asyncio.sleep(cfg.pre_call_sleep_s)
         backoff = cfg.initial_backoff_s
         t_start = time.perf_counter()
         for attempt in range(cfg.max_retries):
@@ -115,7 +120,7 @@ async def summarize_many(
         nonlocal done
         r = await _summarize_one(client, sem, cfg, p.get("human_text", ""), p.get("assistant_text", ""))
         done += 1
-        if progress_cb and (done % 25 == 0 or done == total):
+        if progress_cb and (done % 5 == 0 or done == total):
             progress_cb(done, total)
         return r
 

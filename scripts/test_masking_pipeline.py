@@ -69,19 +69,19 @@ def main() -> int:
     # --- dictionary.apply_dictionary ---
     print("[dictionary]")
     out, repls = dict_mod.apply_dictionary("わたなべがVDで林社長と会議した", d)
-    t.check("主要ケース（v1.1.0: 加藤部長）", out, "加藤部長がAcme Corpで森田社長と会議した")
-    t.assert_true("置換明細あり", len(repls) >= 3)
+    t.check("主要ケース（v1.2.0: わたなべは実名のまま）", out, "わたなべがAcme Corpで森田社長と会議した")
+    t.assert_true("置換明細あり（VD+林社長の2件以上）", len(repls) >= 2)
 
     # preserve_as_is の保護: 「クロ」「Claude」が辞書由来で誤変換されない
     out2, _ = dict_mod.apply_dictionary("クロ と Claude は Vertex AI で動く", d)
     t.check("preserve 保護", out2, "クロ と Claude は Vertex AI で動く")
 
-    # 長語句優先: 「nabeyk123-source」が「nabeyk123」より先に置換される（v1.1.0: kato-t）
+    # v1.2.0: 作者本人の handle (nabeyk123-source) も実名のまま
     out3, _ = dict_mod.apply_dictionary("リポは github.com/nabeyk123-source/boss-clone", d)
-    t.assert_true(
-        "長語句優先（nabeyk123-source → kato-t）",
-        "kato-t" in out3 and "kato_t-source" not in out3,
-        f"got: {out3}",
+    t.check(
+        "v1.2.0 作者の handle は置換されない",
+        out3,
+        "リポは github.com/nabeyk123-source/boss-clone",
     )
 
     # 4015 → 9999（証券コード）
@@ -93,55 +93,45 @@ def main() -> int:
     twice, _ = dict_mod.apply_dictionary(once, d)
     t.check("辞書適用のべき等性（出力は再適用で変わらない）", twice, once)
 
-    # v1.1.0 主人公衝突回避: 「わたなべ」「田中さん」混在時の処理順序
+    # v1.2.0 作者本人マスキング廃止
     case = "わたなべは田中さんと会議。田中もOKと言った"
     got, _ = dict_mod.apply_dictionary(case, d)
     t.check(
-        "v1.1.0 わたなべ/田中さん/田中 の混在処理",
+        "v1.2.0 わたなべは実名・田中さん→斎藤さん",
         got,
-        "加藤部長は斎藤さんと会議。斎藤もOKと言った",
+        "わたなべは斎藤さんと会議。斎藤もOKと言った",
     )
 
-    # 実在人物7名の追加置換（v1.1.1 で鵜月→野村に変更）
-    got, _ = dict_mod.apply_dictionary("渡邉さんと吉田さん、鵜月さんに連絡", d)
+    # わたなべ系の各表記がすべて残ること
+    for src in ("わたなべ", "わたなべさん", "ワタナベ", "渡辺", "渡邊", "渡邉", "tenyw", "nabeyk123"):
+        got, _ = dict_mod.apply_dictionary(f"prefix {src} suffix", d)
+        t.check(f"v1.2.0 作者本人 '{src}' は残る", got, f"prefix {src} suffix")
+
+    # 実在他人（吉田・鵜月・小池・山崎・久保・本田）は引き続き置換
+    got, _ = dict_mod.apply_dictionary("吉田さん・鵜月さん・小池さん・山崎さん・久保さん・本田さん", d)
     t.check(
-        "v1.1.1 実在7名のうち3名（渡邉/吉田/鵜月）",
+        "v1.2.0 実在他人6名は引き続き置換",
         got,
-        "佐々木さんと鈴木さん、野村さんに連絡",
+        "鈴木さん・野村さん・石井さん・後藤さん・岡田さん・森さん",
     )
 
-    got, _ = dict_mod.apply_dictionary("小池さん・山崎さん・久保さん・本田さんも", d)
-    t.check(
-        "v1.1.0 実在7名のうち4名（小池/山崎/久保/本田）",
-        got,
-        "石井さん・後藤さん・岡田さん・森さんも",
-    )
-
-    # v1.1.1 鵜月→野村（実在「中島さん」との衝突回避）
-    got, _ = dict_mod.apply_dictionary("鵜月さんと打ち合わせ。鵜月から後日連絡。", d)
-    t.check(
-        "v1.1.1 鵜月→野村（中島さんと衝突しない）",
-        got,
-        "野村さんと打ち合わせ。野村から後日連絡。",
-    )
-    # 実在「中島さん」も同文に出るケースで、両方が独立して動くこと
+    # 実在「中島さん」は鵜月→野村のため、混入しても独立に追跡可能
     got, _ = dict_mod.apply_dictionary("鵜月さんと中島さんは別人", d)
     t.assert_true(
-        "v1.1.1 鵜月さん/中島さん 共存（衝突なし）",
+        "v1.1.1 維持: 鵜月さん/中島さん 共存",
         "野村さん" in got and "中島さん" in got and "鵜月" not in got,
         f"got: {got}",
     )
 
-    # 二重変換が起きないことの直接確認: 新規 target が source として再マッチしない
-    new_targets = {"加藤", "加藤部長", "斎藤", "斎藤さん", "佐々木", "佐々木さん",
-                   "鈴木", "鈴木さん", "中島", "中島さん", "石井", "石井さん",
-                   "後藤", "後藤さん", "岡田", "岡田さん", "森", "森さん"}
+    # 二重変換が起きないことの直接確認: target が source として再マッチしない
+    targets = {"斎藤", "斎藤さん", "鈴木", "鈴木さん", "野村", "野村さん",
+               "石井", "石井さん", "後藤", "後藤さん", "岡田", "岡田さん", "森", "森さん"}
     all_sources = set()
     for cat in dict_mod.CATEGORIES_TO_APPLY:
         all_sources.update((d.get(cat) or {}).keys())
-    overlap = new_targets & all_sources
+    overlap = targets & all_sources
     t.assert_true(
-        f"v1.1.0 新規target が source と衝突しない（overlap={overlap or '∅'}）",
+        f"v1.2.0 target が source と衝突しない（overlap={overlap or '∅'}）",
         not overlap,
     )
 

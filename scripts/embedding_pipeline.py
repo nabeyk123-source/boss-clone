@@ -36,6 +36,7 @@ from dotenv import load_dotenv  # noqa: E402
 
 load_dotenv(ROOT / ".env")
 
+from embedding_lib import checkpoint as ckpt_mod  # noqa: E402
 from embedding_lib import decision_classifier as dec_mod  # noqa: E402
 from embedding_lib import embedder as emb_mod  # noqa: E402
 from embedding_lib import summarizer as sum_mod  # noqa: E402
@@ -47,9 +48,12 @@ SRC_MASKED = ROOT / "data" / "processed" / "masked_pairs.jsonl"
 SRC_REVIEW = ROOT / "data" / "processed" / "review_queue.jsonl"
 
 OUT_DIR = ROOT / "data" / "processed" / "embedding"
+CKPT_DIR_BASE = OUT_DIR / "ckpt"
 PATH_PAIRS_DOCS = OUT_DIR / "pairs_docs.jsonl"           # Firestore docs（dry-run 時にローカル出力）
 PATH_VS_JSONL = OUT_DIR / "pair_summaries.jsonl"          # Vector Search 用
 PATH_RUN_REPORT = OUT_DIR / "embedding_report.md"
+
+CHUNK_SIZE = 100  # asyncio.gather に積む pending task の最大数（メモリ/FD 圧迫を回避）
 
 LOG_LEVEL = os.environ.get("LOG_LEVEL", "INFO").upper()
 logging.basicConfig(
@@ -67,7 +71,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--include-review-queue", action="store_true", help="review_queue.jsonl も含める")
     p.add_argument("--dry-run", action="store_true", help="Firestore に書き込まず JSONL だけ出力")
     p.add_argument("--force", action="store_true", help="既存出力を上書き")
-    p.add_argument("--max-concurrency", type=int, default=4, help="Gemini/Embedding の並列度（既定4）")
+    p.add_argument("--max-concurrency", type=int, default=2, help="Gemini/Embedding の並列度（既定2、429回避）")
     return p.parse_args()
 
 
@@ -122,6 +126,60 @@ def run_stage(name: str, coro):
     result = asyncio.run(coro)
     log.info("[stage] %s done (%.1fs)", name, time.perf_counter() - t)
     return result
+
+
+async def run_stage_chunked(
+    name: str,
+    keys: list[str],
+    items: list,
+    stage_async_fn,
+    ckpt_path: Path,
+    progress_cb=None,
+):
+    """ckpt から既処理を読み、未処理だけ CHUNK_SIZE 件単位で stage_async_fn を呼ぶ。
+
+    stage_async_fn は `async fn(items_subset) -> list[tuple[value, status, latency]]` を満たすこと。
+    各 chunk 完了ごとに ckpt JSONL に追記（fsync 込み）、プロセス突然死しても次回 resume できる。
+    """
+    done = ckpt_mod.load_done(ckpt_path)
+    log.info("[%s] resume: ckpt=%d done, total=%d", name, len(done), len(keys))
+
+    pending_idx = [i for i, k in enumerate(keys) if k not in done]
+    log.info("[%s] pending=%d (chunk_size=%d)", name, len(pending_idx), CHUNK_SIZE)
+
+    results: list[tuple] = [None] * len(keys)
+    for k, (v, st) in done.items():
+        if k in keys:
+            results[keys.index(k)] = (v, st, 0.0)
+
+    if not pending_idx:
+        log.info("[%s] all done from ckpt, skipping", name)
+        return results
+
+    n_chunks = (len(pending_idx) + CHUNK_SIZE - 1) // CHUNK_SIZE
+    with ckpt_mod.CheckpointAppender(ckpt_path) as writer:
+        for ci in range(n_chunks):
+            chunk_idx = pending_idx[ci * CHUNK_SIZE : (ci + 1) * CHUNK_SIZE]
+            chunk_items = [items[i] for i in chunk_idx]
+            chunk_keys = [keys[i] for i in chunk_idx]
+
+            t_chunk = time.perf_counter()
+            chunk_results = await stage_async_fn(chunk_items)
+            chunk_dt = time.perf_counter() - t_chunk
+
+            for k, idx, res in zip(chunk_keys, chunk_idx, chunk_results):
+                writer.append(k, res[0], res[1])
+                results[idx] = res
+
+            log.info("[%s] chunk %d/%d (%d items in %.1fs)", name, ci + 1, n_chunks, len(chunk_idx), chunk_dt)
+            if progress_cb:
+                progress_cb(min((ci + 1) * CHUNK_SIZE, len(pending_idx)) + len(done), len(keys))
+
+    return results
+
+
+def make_pair_key(processing_id: str, pair: dict) -> str:
+    return make_doc_id(processing_id, pair.get("conversation_uuid", "noconv"), int(pair.get("pair_index", 0)))
 
 
 def render_report(stats: dict, path: Path) -> None:
@@ -184,59 +242,73 @@ def main() -> int:
     processing_id = derive_processing_id(pairs)
     log.info("processing_id=%s", processing_id)
 
-    # ===== Step 2: 要約 =====
+    # ckpt ディレクトリ（processing_id 単位で分離 → 辞書更新時は別ディレクトリで管理）
+    ckpt_dir = CKPT_DIR_BASE / processing_id
+    ckpt_dir.mkdir(parents=True, exist_ok=True)
+
+    pair_keys = [make_pair_key(processing_id, p) for p in pairs]
+
+    # ===== Step 2: 要約（chunk + ckpt） =====
     t = time.perf_counter()
     sum_cfg = sum_mod.SummarizeConfig(max_concurrency=args.max_concurrency)
-    summaries = run_stage(
-        "summarize",
-        sum_mod.summarize_many(
-            pairs,
-            cfg=sum_cfg,
-            progress_cb=lambda d, total: log.info("summarize %d/%d", d, total),
-        ),
-    )
+
+    async def summarize_stage(items_subset):
+        return await sum_mod.summarize_many(items_subset, cfg=sum_cfg)
+
+    summaries = asyncio.run(run_stage_chunked(
+        "summarize", pair_keys, pairs, summarize_stage,
+        ckpt_dir / "summaries.jsonl",
+        progress_cb=lambda d, total: log.info("summarize %d/%d", d, total),
+    ))
     stage_times["summarize_s"] = time.perf_counter() - t
 
-    # ===== Step 3: トピック =====
+    # ===== Step 3: トピック（chunk + ckpt） =====
     t = time.perf_counter()
     topic_cfg = topic_mod.TopicConfig(max_concurrency=args.max_concurrency)
     summary_texts = [s for s, _, _ in summaries]
-    topic_results = run_stage(
-        "topic_classify",
-        topic_mod.classify_topics_many(
-            summary_texts,
-            cfg=topic_cfg,
-            progress_cb=lambda d, total: log.info("topic %d/%d (LLM)", d, total),
-        ),
-    )
+
+    async def topic_stage(items_subset):
+        return await topic_mod.classify_topics_many(items_subset, cfg=topic_cfg)
+
+    topic_results = asyncio.run(run_stage_chunked(
+        "topic", pair_keys, summary_texts, topic_stage,
+        ckpt_dir / "topics.jsonl",
+        progress_cb=lambda d, total: log.info("topic %d/%d", d, total),
+    ))
     stage_times["topic_s"] = time.perf_counter() - t
 
-    # ===== Step 4: 判断種別 =====
+    # ===== Step 4: 判断種別（chunk + ckpt） =====
     t = time.perf_counter()
     dec_cfg = dec_mod.DecisionConfig(max_concurrency=args.max_concurrency)
-    decision_results = run_stage(
-        "decision_classify",
-        dec_mod.classify_decisions_many(
-            summary_texts,
-            cfg=dec_cfg,
-            progress_cb=lambda d, total: log.info("decision %d/%d", d, total),
-        ),
-    )
+
+    async def decision_stage(items_subset):
+        return await dec_mod.classify_decisions_many(items_subset, cfg=dec_cfg)
+
+    decision_results = asyncio.run(run_stage_chunked(
+        "decision", pair_keys, summary_texts, decision_stage,
+        ckpt_dir / "decisions.jsonl",
+        progress_cb=lambda d, total: log.info("decision %d/%d", d, total),
+    ))
     stage_times["decision_s"] = time.perf_counter() - t
 
-    # ===== Step 5: 埋め込み =====
+    # ===== Step 5: 埋め込み（chunk + ckpt） =====
     t = time.perf_counter()
     emb_cfg = emb_mod.EmbedConfig(max_concurrency=args.max_concurrency)
-    vectors, batch_meta = run_stage(
-        "embed",
-        emb_mod.embed_many(
-            summary_texts,
-            cfg=emb_cfg,
-            progress_cb=lambda d, total: log.info("embed %d/%d", d, total),
-        ),
-    )
+
+    async def embed_stage(items_subset):
+        vecs, _meta = await emb_mod.embed_many(items_subset, cfg=emb_cfg)
+        # 戻り値を (value, status, latency) 形式に正規化（chunk_size = 100 単位なので 2 バッチ程度）
+        return [(v, "ok" if v is not None else "failed", 0.0) for v in vecs]
+
+    vector_results = asyncio.run(run_stage_chunked(
+        "embed", pair_keys, summary_texts, embed_stage,
+        ckpt_dir / "embeddings.jsonl",
+        progress_cb=lambda d, total: log.info("embed %d/%d", d, total),
+    ))
     stage_times["embed_s"] = time.perf_counter() - t
 
+    vectors = [r[0] for r in vector_results]
+    batch_meta = []  # 旧コード互換、chunked では空でOK
     n_embedded = sum(1 for v in vectors if v is not None)
     n_embed_failed = sum(1 for v in vectors if v is None)
 
