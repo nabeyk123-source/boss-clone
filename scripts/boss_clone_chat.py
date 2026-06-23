@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import re
 import sys
 import time
 from pathlib import Path
@@ -79,6 +80,94 @@ async def _input_async(prompt: str) -> str:
     return await loop.run_in_executor(None, input, prompt)
 
 
+def _parse_choice_input(raw: str, options: list[str]) -> tuple[list[str], str | None, str | None]:
+    """ユーザー入力をパース。
+
+    返り値: (selected_options, free_text, error)
+    - selected_options: 選択された options 文字列のリスト
+    - free_text: 自由入力（または None）
+    - error: 範囲外などの再入力すべきエラー（または None）
+
+    ルール:
+    - 空入力 → ([], None, None) でスキップ扱い
+    - 「1,3」のような番号カンマ区切り → 該当 options を selected_options に
+    - N+1 番号（=「その他」スロット）→ free_text 入力フラグ "__OTHER__" を返す
+    - 数字以外で始まる入力 → そのまま free_text 扱い
+    - 範囲外番号 → error を返して再入力
+    """
+    s = (raw or "").strip()
+    if not s:
+        return [], None, None
+
+    n_real = len(options)
+    other_slot = n_real + 1  # 「その他」の番号
+
+    # 「1,3」「1 3」「1、3」のようなカンマ/空白/全角カンマ区切りを許容
+    tokens = [t.strip() for t in re.split(r"[,、\s]+", s) if t.strip()]
+    all_numeric = bool(tokens) and all(t.isdigit() for t in tokens)
+
+    if not all_numeric:
+        # 数字以外で始まる → 全文を自由入力として扱う
+        return [], s, None
+
+    nums: list[int] = []
+    for t in tokens:
+        try:
+            nums.append(int(t))
+        except ValueError:
+            return [], None, f"番号として解釈できません: {t}"
+
+    selected: list[str] = []
+    want_other = False
+    for n in nums:
+        if 1 <= n <= n_real:
+            opt = options[n - 1]
+            if opt not in selected:
+                selected.append(opt)
+        elif n == other_slot:
+            want_other = True
+        else:
+            return [], None, f"範囲外の番号: {n}（有効: 1〜{other_slot}）"
+
+    return selected, ("__OTHER__" if want_other else None), None
+
+
+async def _collect_one_answer(idx: int, question_obj: dict) -> dict:
+    """1 質問分の回答をユーザーから取る。{question, selected_options, free_text} を返す。"""
+    question = question_obj.get("question", "")
+    options = list(question_obj.get("options") or [])
+
+    print(f"  Q{idx}: {question}")
+    if options:
+        for i, opt in enumerate(options, 1):
+            print(f"    [{i}] {opt}")
+        print(f"    [{len(options) + 1}] その他（自由入力）")
+        hint = f"番号をカンマ区切り（例: 1,3）、または自由入力、空 Enter でスキップ"
+    else:
+        hint = "自由入力、空 Enter でスキップ"
+    while True:
+        raw = await _input_async(f"  → {hint}: ")
+        selected, free_marker, err = _parse_choice_input(raw, options)
+        if err:
+            print(f"    ⚠️  {err}、もう一度入力してください")
+            continue
+        free_text: str | None = None
+        if free_marker == "__OTHER__":
+            other_raw = await _input_async(f"    → 「その他」の内容を入力: ")
+            free_text = other_raw.strip() or None
+        elif free_marker is not None:
+            free_text = free_marker
+        return {
+            "question": question,
+            "selected_options": selected,
+            "free_text": free_text,
+        }
+
+
+def _is_answered(ans: dict) -> bool:
+    return bool(ans.get("selected_options")) or bool(ans.get("free_text"))
+
+
 async def conversation_turn(retrieval: RetrievalService, turn_idx: int, user_query: str) -> dict:
     """1 ラウンドの相談（Turn 1 → 質問 → ユーザー回答 → Turn 2）を回す。"""
     # ===== Turn 1: System1 即時実行 + System2 バックグラウンド =====
@@ -122,20 +211,20 @@ async def conversation_turn(retrieval: RetrievalService, turn_idx: int, user_que
 
     # 確認質問
     questions = s1_out.get("questions") or []
+    user_answers: list[dict] = []
     if not questions:
-        # 質問が無い場合は Turn 2 をスキップ
         print()
         print("⚠️  System1 が確認質問を生成しませんでした。Synthesizer に直接進みます。")
-        user_answers: list[str] = []
     else:
         _print_section("🙋 確認させてください")
-        for i, q in enumerate(questions, 1):
-            print(f"  {i}. {q}")
         print()
-        user_answers = []
-        for i, q in enumerate(questions, 1):
-            ans = await _input_async(f"  → 質問{i}への回答（Enterで空回答もOK）: ")
-            user_answers.append(ans.strip())
+        for i, q_obj in enumerate(questions, 1):
+            # questions は v2 で [{question, options}] 形式（v1 互換: str も受ける）
+            if isinstance(q_obj, str):
+                q_obj = {"question": q_obj, "options": []}
+            ans = await _collect_one_answer(i, q_obj)
+            user_answers.append(ans)
+            print()
 
     # ===== Turn 2: System2 を await + Synthesizer =====
     print()

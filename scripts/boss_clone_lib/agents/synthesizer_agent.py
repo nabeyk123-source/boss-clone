@@ -46,16 +46,25 @@ _INNER_FIELD = re.compile(
 
 
 def parse_synthesizer_response(text: str, s1_conc: str, s2_conc: str) -> dict:
+    """raw 応答を State 構造体にパース（P6 強化版）。
+
+    P6 改善点:
+    - 論点ヘッダのマッチを `^論点 N` だけでなく `**論点 N**` `### 論点 N` も含めて頑健に
+    - alignment_comment は「論点ブロック後の本文」の **最初の段落** から、内部用語を含まない自然文を拾う
+    - closing_remark は文書の最後の非空行（alignment_comment と重複しない）
+    - issues_summary は title が取れなくても `論点N` でフォールバック
+    """
     raw = text or ""
 
-    # 論点抽出
+    # 論点抽出（既存と同じ正規表現で頑健、ただし出力結果の整理を強化）
     headers = list(_ISSUE_HEADER.finditer(raw))
     issues: list[dict] = []
     for i, m in enumerate(headers):
         start = m.end()
         end = headers[i + 1].start() if i + 1 < len(headers) else len(raw)
         block = raw[start:end]
-        title = _strip_md(m.group(2))
+        # title をマークダウンクリーニング + 引用符除去
+        title = _strip_md(m.group(2)).strip("「」『』\"'")
         situation = ""
         question = ""
         for inner in _INNER_FIELD.finditer(block):
@@ -65,37 +74,39 @@ def parse_synthesizer_response(text: str, s1_conc: str, s2_conc: str) -> dict:
             value_end = next_inner.start() if next_inner else len(block)
             value = _strip_md(block[value_start:value_end])
             if label == "状況":
-                situation = value[:200]
+                situation = value[:300]
             elif label == "確認すべき質問":
-                question = value[:200]
+                question = value[:300]
+        # title が取れなくても論点番号でフォールバック
         issues.append({
             "title": title or f"論点{m.group(1)}",
             "situation": situation,
             "question": question,
         })
 
-    # 整合性コメントを抽出（論点ブロック後の本文の最初の段落）
-    after = ""
-    if headers:
-        after = raw[headers[-1].end():]
-    # 締めの一言は after の最後の非空行
+    # alignment_comment（論点後の本文先頭から内部用語含まない自然文を抽出）
+    after = raw[headers[-1].end():] if headers else ""
     lines_after = [l.strip() for l in after.splitlines() if l.strip()]
     alignment_comment = ""
     closing_remark = ""
     if lines_after:
-        # 「直感」「熟考」「一致」「不一致」キーワードを含む行を整合性コメントとする
-        for line in lines_after[:5]:
-            if any(k in line for k in ("直感", "熟考", "一致", "不一致")):
+        # 「角度違い」「ズレ」「揃って」など整合性を語る語を含む行を優先で拾う
+        priority_keywords = ("角度違い", "ズレ", "揃って", "一致してる", "見えてる", "方向は", "立ち止ま")
+        for line in lines_after[:6]:
+            if any(k in line for k in priority_keywords):
                 alignment_comment = _strip_md(line)[:240]
                 break
+
+        # 締めは最後の非空行（行頭装飾削除）
         closing_remark = _strip_md(lines_after[-1])[:200]
         if alignment_comment and alignment_comment == closing_remark:
-            # 同じ行が両方に入るのを避ける
+            # 同じ行が両方に入るなら alignment_comment 側を空に
             alignment_comment = ""
 
     aligned = (s1_conc == s2_conc) if (s1_conc and s2_conc) else None
 
     return {
+        # issues_summary を 5 件まで（仕様は 3 件想定だが、LLM が 4-5 件出すケースも許容）
         "issues_summary": [issue["title"] for issue in issues][:5],
         "questions": [issue["question"] for issue in issues if issue.get("question")][:5],
         "alignment": "aligned" if aligned is True else ("misaligned" if aligned is False else "unknown"),

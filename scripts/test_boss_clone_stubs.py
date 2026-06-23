@@ -33,7 +33,7 @@ SESSION_ID = "stub-test-session"
 
 async def run() -> int:
     agent = build_boss_clone()
-    runner = InMemoryRunner(agent=agent)
+    runner = InMemoryRunner(agent=agent, app_name="boss_clone")
     session = await runner.session_service.create_session(
         app_name=runner.app_name,
         user_id=USER_ID,

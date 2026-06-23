@@ -69,7 +69,7 @@ MOCK_MISALIGNED = {
 
 async def run_synth_mock(name: str, mock: dict, user_query: str) -> dict:
     agent = SynthesizerAgent(name="synthesizer", description="統合エージェント")
-    runner = InMemoryRunner(agent=agent)
+    runner = InMemoryRunner(agent=agent, app_name="boss_clone")
     await runner.session_service.create_session(
         app_name=runner.app_name,
         user_id="watanabe",
@@ -97,7 +97,7 @@ async def run_e2e(user_query: str) -> dict:
     s2.set_retrieval(retrieval)
     syn = SynthesizerAgent(name="synthesizer", description="統合")
     boss = build_boss_clone(system1=s1, system2=s2, synthesizer=syn)
-    runner = InMemoryRunner(agent=boss)
+    runner = InMemoryRunner(agent=boss, app_name="boss_clone")
     await runner.session_service.create_session(
         app_name=runner.app_name,
         user_id="watanabe",

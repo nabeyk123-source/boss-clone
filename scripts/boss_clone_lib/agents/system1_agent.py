@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import re
 import time
@@ -57,36 +58,83 @@ def _normalize_confidence(s: str) -> str:
     return "中"
 
 
-def _extract_questions(raw: str) -> list[str]:
-    """確認質問セクションから 2〜3 個の質問を抽出。"""
+def _extract_questions(raw: str) -> list[dict]:
+    """確認質問セクションから JSON 配列を抽出し、{question, options} のリストを返す。
+
+    パース失敗時は legacy（番号付き行）の fallback でテキスト質問だけ拾い、
+    options=[] を埋める（CLI 側で自由入力として扱える）。
+    """
+    # JSON ブロックを優先抽出（```json ... ``` または素の [...] 配列）
+    json_block: str | None = None
+    fenced = re.search(r"```(?:json)?\s*(\[.*?\])\s*```", raw, re.S)
+    if fenced:
+        json_block = fenced.group(1)
+    else:
+        # 「確認質問」セクション以降の最初の JSON 配列
+        section = re.search(r"確認質問[^\n]*\n+(.*?)$", raw, re.S)
+        target = section.group(1) if section else raw
+        bare = re.search(r"(\[\s*\{.*?\}\s*\])", target, re.S)
+        if bare:
+            json_block = bare.group(1)
+
+    if json_block:
+        try:
+            arr = json.loads(json_block)
+            if isinstance(arr, list):
+                out: list[dict] = []
+                for item in arr[:3]:
+                    if not isinstance(item, dict):
+                        continue
+                    q = (item.get("question") or "").strip()
+                    opts = item.get("options") or []
+                    if isinstance(opts, list):
+                        opts = [str(o).strip() for o in opts if str(o).strip()][:4]
+                    else:
+                        opts = []
+                    if q:
+                        out.append({"question": q[:200], "options": opts})
+                if out:
+                    return out
+        except (json.JSONDecodeError, ValueError):
+            pass
+
+    # Fallback: 番号付き行から拾う（options 無し）
     m = re.search(r"確認質問\s*[:：]?\s*\n(.+?)(?:\n\n|\Z)", raw, re.S)
     if not m:
         return []
     block = m.group(1)
-    questions: list[str] = []
+    fallback: list[dict] = []
     for line in block.splitlines():
         line = line.strip()
-        # "1. xxx", "1) xxx", "- xxx", "・xxx" などの行頭を許容
         m2 = re.match(r"^(?:\d+[\.\)）]\s*|[\-・*]\s*)(.+)$", line)
         if m2:
-            q = m2.group(1).strip(" 　[]").strip()
-            if q and len(q) > 4:
-                questions.append(q[:200])
-        if len(questions) >= 3:
+            q = m2.group(1).strip(" 　[]\"`").strip()
+            if q and len(q) >= 3:
+                fallback.append({"question": q[:200], "options": []})
+        if len(fallback) >= 3:
             break
-    return questions
+    return fallback
 
 
 def parse_system1_response(text: str) -> dict:
-    """raw LLM 応答を State 構造体にパース（仕様書 §3.4 + Day3 Step 7-1 拡張）。"""
+    """raw LLM 応答を State 構造体にパース（仕様書 §3.4 + Day3 Step 7-1 + Day4 Phase1 P1/P2 拡張）。"""
     raw = text or ""
-    conclusion = _normalize_conclusion(_extract_field(raw, "直感的結論"))
+    # 内部分類を優先（P2: 自然な言い回し + 内部分類の分離）→ 既存「直感的結論」「直感的判断」もfallback
+    conclusion_raw = (
+        _extract_field(raw, "内部分類")
+        or _extract_field(raw, "直感的結論")
+        or _extract_field(raw, "直感的判断")
+    )
+    conclusion = _normalize_conclusion(conclusion_raw)
+    # 文脈適合の言い回しは別途保持
+    intuitive_phrase = _extract_field(raw, "直感的判断") or _extract_field(raw, "直感的結論")
     confidence = _normalize_confidence(_extract_field(raw, "過去パターンとの一致度"))
     ref_cases = _extract_field(raw, "根拠となる過去ケース")
     concerns = _extract_field(raw, "直感的に気になる点")
     questions = _extract_questions(raw)
     return {
         "intuitive_conclusion": conclusion,
+        "intuitive_phrase": intuitive_phrase,  # P2: 文脈適合の自然な言い回し
         "match_confidence": confidence,
         "reference_cases": [ref_cases] if ref_cases else [],
         "concerns": [c.strip(" ・,") for c in re.split(r"[、,。]|・|;|；", concerns) if c.strip()][:3],

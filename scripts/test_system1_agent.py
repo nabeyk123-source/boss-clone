@@ -46,7 +46,7 @@ async def run_one(query: str, idx: int) -> dict:
     )
     agent.set_retrieval(retrieval)
 
-    runner = InMemoryRunner(agent=agent)
+    runner = InMemoryRunner(agent=agent, app_name="boss_clone")
     await runner.session_service.create_session(
         app_name=runner.app_name,
         user_id="watanabe",

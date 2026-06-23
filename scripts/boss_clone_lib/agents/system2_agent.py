@@ -114,18 +114,35 @@ def parse_system2_response(text: str) -> dict:
     conc_m = re.search(r"(?m)^\s*(?:[#*\-・]\s*)*\**熟考的結論\**\s*[:：]\s*(.+)$", raw)
     conclusion = _normalize_conclusion(conc_m.group(1) if conc_m else "")
 
-    # 確認すべき項目（issues の外、または末尾にまとまっているケース）
+    # 確認すべき項目（P4 強化版）
+    # 「確認すべき項目」セクションの後の箇条書き or 改行リストを拾う。
+    # ヘッダ行に値が無いケースもサポート（例: "確認すべき項目:\n- A\n- B"）
     verification_items: list[str] = []
-    verify_m = re.search(
-        r"(?m)^\s*(?:[\-\*・#]\s*)*\**確認すべき項目\**\s*[:：]\s*(.+?)(?:\n\n|\Z)",
+    verify_header = re.search(
+        r"(?m)^\s*(?:[\-\*・#]\s*)*\**確認すべき項目\**\s*[:：]?\s*$",
         raw,
-        re.S,
     )
-    if verify_m:
-        for line in verify_m.group(1).splitlines():
-            stripped = _strip_md(line).strip()
-            if stripped:
-                verification_items.append(stripped[:200])
+    if verify_header:
+        # ヘッダ単独行のあとから次の空行 or 文書末まで
+        after = raw[verify_header.end():]
+        block_m = re.match(r"\s*\n(.+?)(?:\n\s*\n|\Z)", after, re.S)
+        if block_m:
+            for line in block_m.group(1).splitlines():
+                stripped = _strip_md(line).strip()
+                if stripped:
+                    verification_items.append(stripped[:200])
+    if not verification_items:
+        # 旧パターン: 「確認すべき項目: 内容...」形式
+        verify_m = re.search(
+            r"(?m)^\s*(?:[\-\*・#]\s*)*\**確認すべき項目\**\s*[:：]\s*(.+?)(?:\n\n|\Z)",
+            raw,
+            re.S,
+        )
+        if verify_m:
+            for line in verify_m.group(1).splitlines():
+                stripped = _strip_md(line).strip()
+                if stripped:
+                    verification_items.append(stripped[:200])
 
     # 各論点の trade_offs を全体集計
     all_trade_offs: list[str] = []

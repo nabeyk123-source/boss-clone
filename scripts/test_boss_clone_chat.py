@@ -100,12 +100,31 @@ async def run_scenario(retrieval: RetrievalService, scenario: dict) -> dict:
     print(f"  S1 結論: {s1_out.get('intuitive_conclusion')} (一致度: {s1_out.get('match_confidence')})")
     print(f"  S1 質問数: {len(questions)}")
     for i, q in enumerate(questions, 1):
-        print(f"    Q{i}: {q[:100]}")
+        if isinstance(q, dict):
+            qtext = q.get("question", "")
+            opts = q.get("options") or []
+            opt_disp = " / ".join(opts) if opts else "(自由入力)"
+            print(f"    Q{i}: {qtext[:80]}")
+            print(f"         選択肢: {opt_disp}")
+        else:
+            print(f"    Q{i}: {str(q)[:100]}")
 
-    # ユーザー回答（自動）
-    answers = scenario["answers"][:len(questions)]
+    # ユーザー回答（自動）— v2 構造に変換
+    # SCENARIOS の answers は free_text 想定。selected_options は空で渡す
+    answers_raw = scenario["answers"][:len(questions)]
+    answers = []
+    for q_obj, ans_str in zip(questions, answers_raw):
+        if isinstance(q_obj, dict):
+            qtext = q_obj.get("question", "")
+        else:
+            qtext = str(q_obj)
+        answers.append({
+            "question": qtext,
+            "selected_options": [],
+            "free_text": ans_str,
+        })
     print()
-    print(f"  (ユーザー回答シミュレーション: {len(answers)} 件)")
+    print(f"  (ユーザー回答シミュレーション: {len(answers)} 件、すべて free_text)")
 
     # System2 await + Synthesizer
     t_wait = time.perf_counter()
