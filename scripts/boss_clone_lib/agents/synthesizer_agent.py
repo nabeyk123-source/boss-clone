@@ -163,12 +163,14 @@ class SynthesizerAgent(BaseAgent):
         s1 = state.get("system1_output") or {}
         s2 = state.get("system2_output") or {}
         user_answers = state.get("user_answers") or []
+        attached_document = state.get("attached_document")
 
         prompt = format_prompt(
             user_query=user_query,
             system1_output=s1,
             system2_output=s2,
             user_answers=user_answers,
+            attached_document=attached_document,
         )
         raw, status, latency = await self._call_llm(prompt)
 

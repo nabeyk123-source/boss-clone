@@ -44,6 +44,11 @@ from google.genai import types as genai_types  # noqa: E402
 from boss_clone_lib.agents.synthesizer_agent import SynthesizerAgent  # noqa: E402
 from boss_clone_lib.agents.system1_agent import System1Agent  # noqa: E402
 from boss_clone_lib.agents.system2_agent import System2Agent  # noqa: E402
+from boss_clone_lib.document_loader import (  # noqa: E402
+    MAX_CHARS as DOC_MAX_CHARS,
+    SUPPORTED_FORMATS as DOC_SUPPORTED_FORMATS,
+    load_document,
+)
 from boss_clone_lib.retrieval.service import RetrievalService  # noqa: E402
 from boss_clone_lib.session import history as history_mod  # noqa: E402
 
@@ -295,6 +300,9 @@ def _init_state():
         "pending_user_answers": None,
         "other_text": {},
         "history_save_status": None,  # 'ok' | 'failed' | None
+        # 資料レビューモード
+        "attached_document": None,         # 現在のターンで使う資料（dict or None）
+        "uploader_key_seed": 0,            # uploader リセット用（key 更新で内容クリア）
     }
     for k, v in defaults.items():
         if k not in st.session_state:
@@ -383,7 +391,7 @@ async def _run_single_agent(agent, session_id_suffix: str, state: dict, query: s
     return sess.state
 
 
-async def run_turn1(user_query: str):
+async def run_turn1(user_query: str, attached_document: dict | None = None):
     """System1 + System2 を並列で gather。両方の結果を返す。"""
     retrieval = get_retrieval()
     s1 = System1Agent(name="system1", description="直感")
@@ -391,15 +399,22 @@ async def run_turn1(user_query: str):
     s2 = System2Agent(name="system2", description="熟考")
     s2.set_retrieval(retrieval)
 
+    base_state = {"user_query": user_query, "attached_document": attached_document}
     t0 = time.perf_counter()
-    s1_task = _run_single_agent(s1, "s1", {"user_query": user_query}, user_query)
-    s2_task = _run_single_agent(s2, "s2", {"user_query": user_query}, user_query)
+    s1_task = _run_single_agent(s1, "s1", dict(base_state), user_query)
+    s2_task = _run_single_agent(s2, "s2", dict(base_state), user_query)
     s1_state, s2_state = await asyncio.gather(s1_task, s2_task)
     elapsed = time.perf_counter() - t0
     return s1_state.get("system1_output", {}), s2_state.get("system2_output", {}), elapsed
 
 
-async def run_turn2(user_query: str, s1_out: dict, s2_out: dict, user_answers: list[dict]):
+async def run_turn2(
+    user_query: str,
+    s1_out: dict,
+    s2_out: dict,
+    user_answers: list[dict],
+    attached_document: dict | None = None,
+):
     """Synthesizer を実行して final_response を返す。"""
     syn = SynthesizerAgent(name="synthesizer", description="統合")
     t0 = time.perf_counter()
@@ -410,6 +425,7 @@ async def run_turn2(user_query: str, s1_out: dict, s2_out: dict, user_answers: l
             "system1_output": s1_out,
             "system2_output": s2_out,
             "user_answers": user_answers,
+            "attached_document": attached_document,
         },
         user_query,
     )
@@ -513,8 +529,9 @@ with tab_main:
         status_placeholder = st.empty()
         try:
             current_query = st.session_state.current_query
+            current_doc = st.session_state.attached_document
             (s1_out, s2_out, total_elapsed), _wall = run_with_dynamic_status(
-                lambda: run_turn1(current_query),
+                lambda: run_turn1(current_query, current_doc),
                 status_placeholder,
             )
             st.session_state.system1_output = s1_out
@@ -565,8 +582,9 @@ with tab_main:
             s1_out = st.session_state.system1_output
             s2_out = st.session_state.system2_output
             user_answers = st.session_state.pending_user_answers or []
+            current_doc = st.session_state.attached_document
             (final, syn_elapsed), _wall = run_with_dynamic_status(
-                lambda: run_turn2(current_query, s1_out, s2_out, user_answers),
+                lambda: run_turn2(current_query, s1_out, s2_out, user_answers, current_doc),
                 status_placeholder,
             )
             st.session_state.synthesizer_output = final
@@ -655,6 +673,56 @@ with tab_main:
             st.session_state.turn_state = "processing_turn2"
             st.rerun()
 
+    # ===== 資料添付（chat_input の直上）=====
+    uploader_disabled = st.session_state.turn_state not in ("input", "done")
+    with st.expander("📎 資料を添付してレビューしてもらう（任意）", expanded=False):
+        st.markdown(
+            f"<div class='meta-text'>対応形式: {', '.join('.' + f for f in sorted(DOC_SUPPORTED_FORMATS))} "
+            f"／ {DOC_MAX_CHARS:,} 字を超える資料は先頭から切り詰めます。</div>",
+            unsafe_allow_html=True,
+        )
+        uploader_key = f"file_uploader_{st.session_state.uploader_key_seed}"
+        uploaded = st.file_uploader(
+            label="資料ファイル",
+            type=sorted(DOC_SUPPORTED_FORMATS),
+            accept_multiple_files=False,
+            key=uploader_key,
+            disabled=uploader_disabled,
+            label_visibility="collapsed",
+        )
+        if uploaded is not None and (
+            st.session_state.attached_document is None
+            or st.session_state.attached_document.get("filename") != uploaded.name
+            or st.session_state.attached_document.get("original_char_count") != uploaded.size
+        ):
+            # 新規ファイル選択 → ロード
+            try:
+                data = uploaded.getvalue()
+                doc = load_document(uploaded.name, data)
+            except Exception as e:  # noqa: BLE001
+                doc = {
+                    "filename": uploaded.name, "format": "?", "content": "",
+                    "char_count": 0, "original_char_count": 0, "truncated": False,
+                    "warnings": [], "status": "error", "error": f"{type(e).__name__}: {e}",
+                }
+            st.session_state.attached_document = doc
+
+        doc = st.session_state.attached_document
+        if doc:
+            if doc.get("status") == "ok":
+                st.success(
+                    f"📎 添付済み: **{doc['filename']}** "
+                    f"(.{doc['format']} / {doc['char_count']:,} 字)"
+                )
+                for w in (doc.get("warnings") or []):
+                    st.warning(w)
+            else:
+                st.error(f"📎 読み込み失敗: {doc.get('filename')} — {doc.get('error')}")
+            if st.button("✖ 添付を外す", key="detach_doc"):
+                st.session_state.attached_document = None
+                st.session_state.uploader_key_seed += 1
+                st.rerun()
+
     # chat_input は常に画面下部に固定（input / done で有効）
     user_input_disabled = st.session_state.turn_state not in ("input", "done")
     user_input = st.chat_input(
@@ -673,7 +741,13 @@ with tab_main:
             st.session_state.other_text = {}
 
         st.session_state.current_query = user_input
-        _push_msg("user", user_input)
+        # 添付がある場合は user バブルにメタ情報を併記
+        doc = st.session_state.attached_document
+        if doc and doc.get("status") == "ok":
+            doc_line = f"📎 {doc['filename']} (.{doc['format']} / {doc['char_count']:,} 字)"
+            _push_msg("user", f"{doc_line}\n\n{user_input}")
+        else:
+            _push_msg("user", user_input)
         # 状態フラグだけ立てて即 rerun → 次サイクルで user バブル描画 + Turn 1 実行
         st.session_state.turn_state = "processing_turn1"
         st.rerun()

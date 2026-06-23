@@ -15,7 +15,7 @@ from google.adk.agents.invocation_context import InvocationContext
 from google.adk.events import Event, EventActions
 from google.genai import types
 
-from ..prompts.system2 import PROMPT, format_kb
+from ..prompts.system2 import PROMPT, format_attached_document, format_kb
 from ..retrieval.service import RetrievalService
 
 
@@ -218,6 +218,7 @@ class System2Agent(BaseAgent):
     ) -> AsyncGenerator[Event, None]:
         state = ctx.session.state or {}
         user_query = state.get("user_query", "")
+        attached_document = state.get("attached_document")
         retrieval: RetrievalService | None = getattr(self, "_retrieval", None)
 
         # 1) 4 layer の KB を取得
@@ -231,6 +232,7 @@ class System2Agent(BaseAgent):
         # 2) Build prompt
         prompt = PROMPT.format(
             user_query=user_query or "(empty)",
+            attached_document=format_attached_document(attached_document),
             retrieved_l1=format_kb(kb.get("L1_principles", [])),
             retrieved_l2=format_kb(kb.get("L2_regulations", [])),
             retrieved_l3=format_kb(kb.get("L3_strategy", [])),

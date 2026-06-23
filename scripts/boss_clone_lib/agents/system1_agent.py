@@ -16,7 +16,7 @@ from google.adk.agents.invocation_context import InvocationContext
 from google.adk.events import Event, EventActions
 from google.genai import types
 
-from ..prompts.system1 import PROMPT, format_pairs
+from ..prompts.system1 import PROMPT, format_attached_document, format_pairs
 from ..retrieval.service import RetrievalService
 
 
@@ -196,6 +196,7 @@ class System1Agent(BaseAgent):
     ) -> AsyncGenerator[Event, None]:
         state = ctx.session.state or {}
         user_query = state.get("user_query", "")
+        attached_document = state.get("attached_document")
         retrieval: RetrievalService | None = getattr(self, "_retrieval", None)
 
         # 1) Retrieve similar pairs
@@ -216,6 +217,7 @@ class System1Agent(BaseAgent):
         # 2) Build prompt
         prompt = PROMPT.format(
             user_query=user_query or "(empty)",
+            attached_document=format_attached_document(attached_document),
             retrieved_pairs=format_pairs(pairs),
         )
 
