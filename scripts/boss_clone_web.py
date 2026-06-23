@@ -375,10 +375,20 @@ def get_retrieval() -> RetrievalService:
 
 # ===== Async helpers =====
 
-async def _run_single_agent(agent, session_id_suffix: str, state: dict, query: str):
-    """1 つのエージェントだけを InMemoryRunner で実行して最終 state を返す。"""
+async def _run_single_agent(
+    agent,
+    session_id_suffix: str,
+    state: dict,
+    query: str,
+    session_id_base: str,
+):
+    """1 つのエージェントだけを InMemoryRunner で実行して最終 state を返す。
+
+    NOTE: ここは worker スレッドから呼ばれる前提。st.session_state には触らない。
+    呼び元（メインスレッド）で session_id を抜き取って渡すこと。
+    """
     runner = InMemoryRunner(agent=agent, app_name=APP_NAME)
-    sid = f"{st.session_state.session_id}-{session_id_suffix}"
+    sid = f"{session_id_base}-{session_id_suffix}"
     await runner.session_service.create_session(
         app_name=runner.app_name, user_id=USER_ID, session_id=sid, state=state,
     )
@@ -391,9 +401,17 @@ async def _run_single_agent(agent, session_id_suffix: str, state: dict, query: s
     return sess.state
 
 
-async def run_turn1(user_query: str, attached_document: dict | None = None):
-    """System1 + System2 を並列で gather。両方の結果を返す。"""
-    retrieval = get_retrieval()
+async def run_turn1(
+    user_query: str,
+    attached_document: dict | None,
+    session_id_base: str,
+    retrieval: RetrievalService,
+):
+    """System1 + System2 を並列で gather。両方の結果を返す。
+
+    NOTE: worker スレッドから呼ばれる。retrieval と session_id_base は
+    メインスレッドで事前に解決して渡す（st.cache_resource / st.session_state を回避）。
+    """
     s1 = System1Agent(name="system1", description="直感")
     s1.set_retrieval(retrieval)
     s2 = System2Agent(name="system2", description="熟考")
@@ -401,8 +419,8 @@ async def run_turn1(user_query: str, attached_document: dict | None = None):
 
     base_state = {"user_query": user_query, "attached_document": attached_document}
     t0 = time.perf_counter()
-    s1_task = _run_single_agent(s1, "s1", dict(base_state), user_query)
-    s2_task = _run_single_agent(s2, "s2", dict(base_state), user_query)
+    s1_task = _run_single_agent(s1, "s1", dict(base_state), user_query, session_id_base)
+    s2_task = _run_single_agent(s2, "s2", dict(base_state), user_query, session_id_base)
     s1_state, s2_state = await asyncio.gather(s1_task, s2_task)
     elapsed = time.perf_counter() - t0
     return s1_state.get("system1_output", {}), s2_state.get("system2_output", {}), elapsed
@@ -413,9 +431,10 @@ async def run_turn2(
     s1_out: dict,
     s2_out: dict,
     user_answers: list[dict],
-    attached_document: dict | None = None,
+    attached_document: dict | None,
+    session_id_base: str,
 ):
-    """Synthesizer を実行して final_response を返す。"""
+    """Synthesizer を実行して final_response を返す。worker スレッドから呼ばれる。"""
     syn = SynthesizerAgent(name="synthesizer", description="統合")
     t0 = time.perf_counter()
     syn_state = await _run_single_agent(
@@ -428,6 +447,7 @@ async def run_turn2(
             "attached_document": attached_document,
         },
         user_query,
+        session_id_base,
     )
     elapsed = time.perf_counter() - t0
     return syn_state.get("final_response", {}), elapsed
@@ -528,10 +548,13 @@ with tab_main:
     if st.session_state.turn_state == "processing_turn1":
         status_placeholder = st.empty()
         try:
+            # メインスレッドで session_state / cache_resource を解決してから worker に渡す
             current_query = st.session_state.current_query
             current_doc = st.session_state.attached_document
+            session_id_base = st.session_state.session_id
+            retrieval_svc = get_retrieval()
             (s1_out, s2_out, total_elapsed), _wall = run_with_dynamic_status(
-                lambda: run_turn1(current_query, current_doc),
+                lambda: run_turn1(current_query, current_doc, session_id_base, retrieval_svc),
                 status_placeholder,
             )
             st.session_state.system1_output = s1_out
@@ -583,8 +606,9 @@ with tab_main:
             s2_out = st.session_state.system2_output
             user_answers = st.session_state.pending_user_answers or []
             current_doc = st.session_state.attached_document
+            session_id_base = st.session_state.session_id
             (final, syn_elapsed), _wall = run_with_dynamic_status(
-                lambda: run_turn2(current_query, s1_out, s2_out, user_answers, current_doc),
+                lambda: run_turn2(current_query, s1_out, s2_out, user_answers, current_doc, session_id_base),
                 status_placeholder,
             )
             st.session_state.synthesizer_output = final

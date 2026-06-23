@@ -115,3 +115,23 @@
 - 適用範囲: ハッカソン提出物・portfolio・公開デモ・OSS 副業全般。**作者本人の名前を判定する 2 条件**: (a) 既に公開ハンドル / ブランド化されているか、(b) その名前が出ることで作者のストーリーが強化されるか。両方 yes なら実名で出す。
 - 横展開判断: **昇格候補**（理由: AI 支援開発の副産物として個人ブランドに紐づける作品が増える中、「架空 vs 実名」の判断基準は再発確実。`_standards/nfr-base.md` の C-6「個人情報保護対応」周辺に「作者本人の名前判定基準」として追加候補。pdm_and_ai note 記事化候補：「ハッカソン作品で作者の名前を出すかマスクするかの判断軸」）。
 - 補足: この方針転換の **代償**: v1.0〜v1.1.1 で生成した `masked_pairs.jsonl` には「加藤部長」が大量に含まれ、v1.2.0 で再処理して上書き必須。8分の処理時間と $0.09 の追加コストで済む（マスキングは Gemini 分類込みでも 484s）。早期の方針決定が辞書のべき等性とトレードオフ、というのが運用上の教訓。
+
+### L-008: Streamlit の `st.session_state` は worker スレッドから触ると `AttributeError`（"session_id" がありません）になる
+- 日付: 2026-06-23
+- 症状: ローカル `localhost:8501` / 公開 Cloud Run どちらでも、入力直後の Turn 1 実行で `AttributeError: st.session_state には属性 "session_id" がありません。初期化を忘れていませんか？` が発生。`_init_state()` は呼んでいて、main スレッドで `session_state.session_id` を print すれば値が見える。
+- 原因: Streamlit の `st.session_state` は **ScriptRunContext を持つスレッド（= Streamlit が起動したスクリプトランナースレッド）からしか参照できない**。本プロジェクトでは「動的 spinner（TODO-P11）」のために `run_with_dynamic_status` が `threading.Thread` で `asyncio.run(coro_factory())` を実行する設計を入れていた（メインスレッドで進捗ラベルを更新するため）。その worker スレッドの内側で `_run_single_agent` が `st.session_state.session_id` を読みに行っていたため、ScriptRunContext を持たないスレッドでの session_state 参照になり例外。Streamlit 1.36 前後で `st.session_state` のクロススレッド参照が「黙って空 dict / 警告」から「`AttributeError` で硬く落とす」に変わった（このプロジェクトでは 1.58.0 で確実に落ちる）。Day 4 後半の資料添付実装ターンでは _run_single_agent 自体は触っていなかったが、たまたまそのコードパスを通る相談（「ふるまちPayで苦しんでる」のような Vector Search が遅めの入力）でユーザーが踏んだ。
+- 解決: worker スレッドに渡す前に **メインスレッド側で session_id / cache_resource をぜんぶ抜き取り、引数として closure に閉じ込める**。具体的には:
+  ```python
+  # NG（worker thread で session_state 参照）
+  lambda: run_turn1(current_query, current_doc)
+  # 内側で st.session_state.session_id, get_retrieval() を呼ぶ → AttributeError
+
+  # OK（メインスレッドで解決して引数で渡す）
+  session_id_base = st.session_state.session_id
+  retrieval_svc = get_retrieval()
+  lambda: run_turn1(current_query, current_doc, session_id_base, retrieval_svc)
+  ```
+  並せて `_run_single_agent(..., session_id_base)`, `run_turn1(..., session_id_base, retrieval)`, `run_turn2(..., session_id_base)` のシグネチャを「依存を全部受け取る」形に書き直した。worker 側は Streamlit を完全に知らない関数になる。
+- 適用範囲: Streamlit + 任意の worker スレッド / asyncio.run / executor を組み合わせる全ての場面。動的進捗表示・並列 LLM 呼び出し・バックグラウンドポーリングなど、Streamlit のシングルスレッド前提を破る瞬間が境界になる。`@st.cache_resource` / `@st.cache_data` も内部で ScriptRunContext を見るため、worker からの初回呼び出しは同じ罠を踏む — **必ずメインスレッドで一度呼んで戻り値だけ持ち込む**。
+- 横展開判断: **要**（理由: Streamlit を「動的進捗表示」用に少しでも非同期化した瞬間に踏む。Streamlit + LLM の組み合わせは今後も増える定番構成で、`pdm_and_ai` 系 / 副業の社内ツール開発でも再発する確度が高い。`_standards/nfr-base.md` の E 系（AI実装）か、新カテゴリ「F: フロントエンド統合」を立てて『Streamlit / Gradio 等のシングルスレッドフレームワークで worker thread を使う時は session/cache を必ずメインで解決してから渡す』として昇格候補）。
+- 補足: 同じ症状が "data" の名前で出ることがあるが（"data has no attribute X"）、根本原因は同じ ScriptRunContext 不在。デバッグ時は worker 関数の中に `import streamlit as st; print(hasattr(st, 'runtime'))` などを仕込み、Streamlit 側が「自分が居る」と認識しているかを確認できる。
