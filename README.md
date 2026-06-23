@@ -73,9 +73,9 @@ Turn 2 (16〜24秒):
 |---|---|
 | 言語 / フレームワーク | Python 3.14 / [Google ADK](https://google.github.io/adk-docs/) 2.3.0 |
 | LLM | Gemini 2.5 Flash / Pro（Vertex AI 経由、Free Credit 対象） |
-| Embedding | text-multilingual-embedding-002（768次元） |
-| ベクター検索 | Vertex AI Vector Search |
-| データストア | Firestore（pairs 2787件、acme_kb 46件） |
+| Embedding | text-multilingual-embedding-002（768次元、L2正規化済） |
+| ベクター検索 | **Firestore + numpy（アプリ内コサイン類似度）**（Day 4 で Vector Search から移行、L-009） |
+| データストア | Firestore（pairs 2787件、acme_kb 46件、embedding 同梱） |
 | デプロイ | Cloud Run（Day 4 以降） |
 
 ---

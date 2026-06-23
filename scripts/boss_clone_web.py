@@ -364,11 +364,17 @@ _init_state()
 
 @st.cache_resource
 def get_retrieval() -> RetrievalService:
+    """Cloud Run コールドスタート時に InMemoryVectorStore を Firestore からロード。
+
+    - 起動時 1 回だけ実行（@st.cache_resource）
+    - 約 15 秒（pairs 2,787 + acme_kb 46）
+    - embed warmup も同時に走らせて Gemini クライアントの初期化を吸収
+    """
     svc = RetrievalService()
-    # warmup を非同期で呼ぶ
     try:
-        asyncio.run(svc.embed_query("warmup"))
+        svc.warmup()  # store load + embed warmup（同期）
     except Exception:
+        # warmup 失敗でも RetrievalService 自体は使える（次の呼び出しで lazy init）
         pass
     return svc
 

@@ -7,10 +7,8 @@
 #   GOOGLE_CLOUD_PROJECT
 #   GOOGLE_CLOUD_LOCATION=us-central1
 #   GOOGLE_GENAI_USE_VERTEXAI=TRUE
-#   VS_PAIR_INDEX_RESOURCE      (Vector Search index フル resource path)
-#   VS_PAIR_ENDPOINT_RESOURCE   (Vector Search endpoint フル resource path)
-#   VS_PAIR_DEPLOYED_ID         (例: pair_summaries_v1)
-#   VS_BUCKET                   (任意)
+# Day 4 後半（L-009）以降、Vector Search は使わず Firestore + アプリ内 cos 類似度。
+# VS_PAIR_* 環境変数は不要。
 
 FROM python:3.11-slim
 

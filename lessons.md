@@ -135,3 +135,24 @@
 - 適用範囲: Streamlit + 任意の worker スレッド / asyncio.run / executor を組み合わせる全ての場面。動的進捗表示・並列 LLM 呼び出し・バックグラウンドポーリングなど、Streamlit のシングルスレッド前提を破る瞬間が境界になる。`@st.cache_resource` / `@st.cache_data` も内部で ScriptRunContext を見るため、worker からの初回呼び出しは同じ罠を踏む — **必ずメインスレッドで一度呼んで戻り値だけ持ち込む**。
 - 横展開判断: **要**（理由: Streamlit を「動的進捗表示」用に少しでも非同期化した瞬間に踏む。Streamlit + LLM の組み合わせは今後も増える定番構成で、`pdm_and_ai` 系 / 副業の社内ツール開発でも再発する確度が高い。`_standards/nfr-base.md` の E 系（AI実装）か、新カテゴリ「F: フロントエンド統合」を立てて『Streamlit / Gradio 等のシングルスレッドフレームワークで worker thread を使う時は session/cache を必ずメインで解決してから渡す』として昇格候補）。
 - 補足: 同じ症状が "data" の名前で出ることがあるが（"data has no attribute X"）、根本原因は同じ ScriptRunContext 不在。デバッグ時は worker 関数の中に `import streamlit as st; print(hasattr(st, 'runtime'))` などを仕込み、Streamlit 側が「自分が居る」と認識しているかを確認できる。
+
+### L-009: 数千件規模の検索なら Vertex AI Vector Search より「Firestore + numpy + メモリ常駐」が圧倒的にコスト効率良い
+- 日付: 2026-06-23
+- 症状: Vector Search endpoint を Day 2 にセットアップしたあと寝かせていたつもりが、`automaticResources, minReplicas=1` で **24/7 で 1 node 維持**され、約 **¥80-100/h（月 ¥60,000 規模）** で課金継続。ハッカソン Free Credit ¥47,966 を 1 ヶ月で焼き切るペース。Day 4 着手時点 ¥0 → 20 時間で ¥2,400。
+- 原因: Vertex AI Vector Search は数十万件以上のエンタープライズ検索を想定した SKU。最小構成でも「serving node 常時 1 台」がベースライン。**ハッカソン規模（2,787 pair + 46 KB = 2,833 件 × 768 次元 = 約 8MB）にはオーバースペックで、性能要件より価格モデルが先に壊れる**。
+- 解決:
+  1. 全 embedding（768-dim, L2 正規化済 → dot product = cos sim）を Firestore に backfill（`scripts/backfill_embeddings_to_firestore.py`、2,833 docs / コスト $0.005）
+  2. アプリ起動時に `InMemoryVectorStore.load()` で全件を numpy float32 行列にロード（~15 秒、~8MB）
+  3. クエリ時は `emb_matrix @ query` で全件ドットプロダクト → `argpartition` で top-k（全件 2,800 でも ~1ms）
+  4. tag / topic / layer フィルタは bool マスクで `np.where(mask, sims, -inf)`
+  5. RetrievalService の公開シグネチャ（`get_similar_pairs` / `get_relevant_kb`）は無改修で差し替え可能
+  6. Vector Search endpoint + index を teardown して課金停止（Day 2 で書いた `--teardown` フローが効いた → L-005 の積み立て）
+- 適用範囲: 「PoC / ハッカソン / 個人プロダクト / 中小規模社内ツール」のセマンティック検索全般。ベクトル件数の閾値ざっくり:
+  | 件数 | 推奨 |
+  |---|---|
+  | ~10,000 | **Firestore + numpy 一択**（メモリ ~30MB、ロード ~30s 以内、検索 数ms） |
+  | 10,000-100,000 | numpy + メモリマップ or sklearn / faiss (ローカル) |
+  | 100,000~ | Vector Search / pgvector / Weaviate 等の専用基盤 |
+  - ベクトル次元数も効く（768→1536 でメモリ 2 倍）。1M 件 × 768 で約 3GB なので、Cloud Run 標準 2GB 上限を超えるあたりが Firestore + numpy の物理上限。
+- 横展開判断: **必ず昇格**（理由: AI 支援開発で「セマンティック検索を試したい」要件は今後も頻発。最初から VS を選ぶ罠を回避できる判断軸として `_standards/nfr-base.md` の E 系か新カテゴリ「F: AI Infra選定」に「ベクトル検索基盤の選定はまず件数で考える。10,000 件未満は Firestore + numpy、それ以上で専用基盤を検討」として昇格候補。pdm_and_ai note 記事化候補：「ハッカソン規模なら Vector Search は罠 — ベクトル件数 × 価格モデルの 1 次マッチング指針」）。
+- 補足: 検索品質はほぼ同等（同じ embedding model、dot product = cos sim、L2 正規化済）。Day 3 ログの `distance=0.7551` vs 新実装の `distance=0.7356` 等、誤差は 0.02 以内で sub-second スコアリングが既に変わる範囲。再現性 (E-1) の観点では VS の方が「サービス保証された等しい計算」だが、ハッカソンには numpy で十分。Vector Search を「正答セット側」として残し、定期的に対照検証する運用も可能（が、課金停止後はそれもできないので、品質回帰は Day 3 のシナリオログを RAW スコアと突き合わせる形に縮退）。
