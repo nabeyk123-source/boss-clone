@@ -31,14 +31,50 @@ class RetrievedItem:
     doc: dict = field(default_factory=dict)
 
 
+def _state_from_env() -> dict:
+    """Cloud Run 等の本番では state.json を持たず、環境変数から resource を組み立てる。
+
+    認識する環境変数:
+      VS_PAIR_INDEX_RESOURCE: pair_summaries の index resource (projects/.../indexes/...)
+      VS_PAIR_ENDPOINT_RESOURCE: pair_summaries の endpoint resource (projects/.../indexEndpoints/...)
+      VS_PAIR_DEPLOYED_ID: deployed_index_id (例 'pair_summaries_v1')
+      VS_BUCKET: gs:// bucket name（任意）
+    どれか欠けていれば空 dict を返す（呼び出し元で state.json fallback）。
+    """
+    pair_idx = os.environ.get("VS_PAIR_INDEX_RESOURCE")
+    pair_ep = os.environ.get("VS_PAIR_ENDPOINT_RESOURCE")
+    pair_deployed = os.environ.get("VS_PAIR_DEPLOYED_ID")
+    if pair_idx and pair_ep and pair_deployed:
+        bucket = os.environ.get("VS_BUCKET", "")
+        return {
+            "pair_summaries": {
+                "index_resource": pair_idx,
+                "endpoint_resource": pair_ep,
+                "deployed_index_id": pair_deployed,
+                "bucket": bucket,
+                "gcs_uri": f"gs://{bucket}/pair_summaries" if bucket else "",
+            }
+        }
+    return {}
+
+
 def _load_state() -> dict:
+    # 1) 環境変数優先（Cloud Run など state.json を持たない環境）
+    env_state = _state_from_env()
+    if env_state:
+        return env_state
+    # 2) ローカル state.json（開発時）
     if not VS_STATE_FILE.exists():
         raise FileNotFoundError(
-            f"{VS_STATE_FILE} が空 / 不在です。先に test_vs_setup.py --setup を実行してください"
+            f"{VS_STATE_FILE} が空 / 不在で、VS_PAIR_* 環境変数も未設定です。"
+            f"開発時は test_vs_setup.py --setup、本番は環境変数 VS_PAIR_INDEX_RESOURCE / "
+            f"VS_PAIR_ENDPOINT_RESOURCE / VS_PAIR_DEPLOYED_ID を設定してください"
         )
     state = json.loads(VS_STATE_FILE.read_text(encoding="utf-8"))
     if not state:
-        raise RuntimeError("VS state ファイルが空です。setup されていないか、teardown 済みです")
+        raise RuntimeError(
+            "VS state ファイルが空で、VS_PAIR_* 環境変数も未設定。setup されていないか teardown 済みです"
+        )
     return state
 
 

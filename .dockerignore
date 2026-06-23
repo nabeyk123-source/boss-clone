@@ -1,0 +1,60 @@
+# Docker ビルドコンテキストから除外（イメージサイズ削減 + 機密保護）
+
+# Git / IDE
+.git/
+.gitignore
+.vscode/
+.idea/
+*.swp
+
+# Python キャッシュ・仮想環境
+.venv/
+venv/
+env/
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# 機密データ・学習データ（絶対にイメージに含めない）
+.env
+.env.*
+data/raw/
+data/processed/
+data/excluded/
+data/interim/
+docs/masking_dictionary.json
+scripts/*.state.json
+
+# ローカル運用専用
+*.log
+logs/
+.DS_Store
+Thumbs.db
+
+# ドキュメント（ランタイム不要、サイズ削減のため除外）
+docs/
+*.md
+!README.md
+
+# テスト関連（ランタイム不要）
+scripts/test_*.py
+scripts/analyze_export.py
+scripts/masking_pipeline.py
+scripts/embedding_pipeline.py
+scripts/acme_kb_loader.py
+scripts/masking_lib/
+scripts/embedding_lib/
+scripts/hello_agent.py
+
+# 仕様書類
+masking_pipeline_spec.md
+lessons.md
+CLAUDE.md
+LICENSE
+
+# ADK 等のローカルキャッシュ
+.adk/
+.cache/

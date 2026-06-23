@@ -1,0 +1,11 @@
+# Cloud Run / 本番ビルド用の依存リスト
+# 開発時の .venv も同じバージョン揃え。
+# ADK は Web UI 直接では使わないが boss_clone_lib/coordinator.py 等が import する。
+
+google-adk==2.3.0
+google-cloud-aiplatform==1.158.0
+google-cloud-firestore==2.27.0
+google-cloud-storage==3.12.0
+google-genai==2.9.0
+python-dotenv==1.2.2
+streamlit==1.58.0

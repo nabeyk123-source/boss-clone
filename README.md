@@ -5,6 +5,7 @@
 過去の Claude 対話ログを学習データとして、わたなべ部長の判断パターンを再現する **マルチエージェント** を構築。
 論点整理・前提質問・優先度判断・MUST/WANT 分離といった「考え方の OS」を AI で再現することが目標。
 
+- **🌐 公開デモ**: https://boss-clone-web-710145835677.us-central1.run.app
 - **題材**: 上司の判断OS（部長クローン）
 - **提出期限**: 2026-07-10
 - **ライセンス**: [MIT](LICENSE)
@@ -128,6 +129,30 @@ python scripts/acme_kb_loader.py                    # Acme KB 投入
 ```powershell
 python scripts/boss_clone_chat.py
 ```
+
+### 7. ローカルで Streamlit Web UI 起動
+
+```powershell
+.\.venv\Scripts\streamlit.exe run scripts\boss_clone_web.py
+```
+
+→ `http://localhost:8501` でブラウザが開きます。
+
+### 8. Cloud Run へのデプロイ
+
+```bash
+gcloud run deploy boss-clone-web \
+  --source . \
+  --region us-central1 \
+  --allow-unauthenticated \
+  --memory 2Gi --cpu 1 \
+  --min-instances 0 --max-instances 3 \
+  --timeout 300 \
+  --set-env-vars="GOOGLE_CLOUD_PROJECT=...,VS_PAIR_INDEX_RESOURCE=...,VS_PAIR_ENDPOINT_RESOURCE=...,VS_PAIR_DEPLOYED_ID=pair_summaries_v1,..."
+```
+
+[Dockerfile](Dockerfile) と [.dockerignore](.dockerignore) を同梱。Cloud Build で自動ビルドされます。
+必須環境変数は `Dockerfile` のコメント参照。
 
 ---
 
